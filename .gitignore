@@ -1,0 +1,12 @@
+build/
+.vs/
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.log
+*.tlog
+*.lastbuildstate
+*.user
+*.suo
+ratings.txt
