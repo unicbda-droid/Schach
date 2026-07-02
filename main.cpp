@@ -435,6 +435,7 @@ static unsigned char* ttf_data = nullptr;
 static int ttf_len = 0;
 GLuint game_vao = 0, game_vbo = 0;
 GLuint game_shader = 0;
+GLuint shader_3d = 0;
 
 void bake_font(int px) {
     if (!ttf_data) return;
@@ -540,13 +541,20 @@ void ortho(float l, float r, float b, float t) {
 }
 
 bool init_shaders() {
+    auto c=[](GLuint t,const char* s)->GLuint{GLuint sh=glCreateShader(t);glShaderSource(sh,1,&s,nullptr);glCompileShader(sh);GLint ok;glGetShaderiv(sh,GL_COMPILE_STATUS,&ok);if(!ok){char l[512];glGetShaderInfoLog(sh,512,nullptr,l);fprintf(stderr,"S:%s\n",l);return 0;}return sh;};
+    // 2D shader
     const char* vss="#version 330 core\nlayout(location=0)in vec3 aPos;layout(location=1)in vec3 aCol;uniform mat4 uProj;out vec3 vCol;void main(){gl_Position=uProj*vec4(aPos,1);vCol=aCol;}";
     const char* fss="#version 330 core\nin vec3 vCol;out vec4 FragColor;void main(){FragColor=vec4(vCol,1);}";
-    auto c=[](GLuint t,const char* s)->GLuint{GLuint sh=glCreateShader(t);glShaderSource(sh,1,&s,nullptr);glCompileShader(sh);GLint ok;glGetShaderiv(sh,GL_COMPILE_STATUS,&ok);if(!ok){char l[512];glGetShaderInfoLog(sh,512,nullptr,l);fprintf(stderr,"S:%s\n",l);return 0;}return sh;};
-    GLuint vs=c(GL_VERTEX_SHADER,vss),fs=c(GL_FRAGMENT_SHADER,fss); if(!vs||!fs) return false;
+    {GLuint vs=c(GL_VERTEX_SHADER,vss),fs=c(GL_FRAGMENT_SHADER,fss);  if(!vs||!fs) return false;
     game_shader=glCreateProgram();glAttachShader(game_shader,vs);glAttachShader(game_shader,fs);glLinkProgram(game_shader);
-    GLint ok;glGetProgramiv(game_shader,GL_LINK_STATUS,&ok);glDeleteShader(vs);glDeleteShader(fs);
-    return ok?true:false;
+    GLint ok;glGetProgramiv(game_shader,GL_LINK_STATUS,&ok);glDeleteShader(vs);glDeleteShader(fs); if(!ok) return false;}
+    // 3D shader
+    const char* v3d="#version 330 core\nlayout(location=0)in vec3 aP;layout(location=1)in vec3 aN;layout(location=2)in vec3 aC;uniform mat4 uMVP;uniform mat4 uM;uniform vec3 uLD;out vec3 vN;out vec3 vC;out vec3 vP;void main(){vec4 wp=uM*vec4(aP,1);vP=wp.xyz;vN=mat3(transpose(inverse(uM)))*aN;vC=aC;gl_Position=uMVP*vec4(aP,1);}";
+    const char* f3d="#version 330 core\nin vec3 vN;in vec3 vC;in vec3 vP;uniform vec3 uVP;uniform float uAmb;uniform vec3 uLD;uniform vec3 uCol;out vec4 F;void main(){vec3 col=vC*uCol;vec3 n=normalize(vN);vec3 ld=normalize(uLD);float df=max(dot(n,-ld),0);vec3 vd=normalize(uVP-vP);vec3 rd=reflect(ld,n);float sp=pow(max(dot(vd,rd),0),64);float sh=step(0.001,df);vec3 amb=uAmb*col;vec3 dif=df*col;vec3 spe=sh*sp*vec3(0.8,0.85,0.9);F=vec4(min(amb+dif+spe,vec3(1)),1);}";
+    GLuint vs3=c(GL_VERTEX_SHADER,v3d),fs3=c(GL_FRAGMENT_SHADER,f3d); if(!vs3||!fs3) return false;
+    shader_3d=glCreateProgram();glAttachShader(shader_3d,vs3);glAttachShader(shader_3d,fs3);glLinkProgram(shader_3d);
+    GLint ok3;glGetProgramiv(shader_3d,GL_LINK_STATUS,&ok3);glDeleteShader(vs3);glDeleteShader(fs3);
+    return ok3?true:false;
 }
 
 void fill_rect(float x,float y,float w,float h,float r,float g,float b){
@@ -799,6 +807,14 @@ void opt_change(int dir) {
 // ============================================================
 // RENDERING: CHESS GAME
 // ============================================================
+extern bool enable_3d;
+extern bool cam_dragging;
+extern double cam_drag_x,cam_drag_y;
+extern float cam_theta,cam_phi;
+void render_3d();
+void cam_update();
+int pick_square(double mx,double my);
+void handle_click(double mx,double my);
 void render_piece(float cx,float cy,float s,Piece p,Color c){
     float pr,pg,pb;
     if(c==WHITE){pr=0.95f;pg=0.93f;pb=0.85f;}else{pr=0.12f;pg=0.12f;pb=0.14f;}
@@ -815,9 +831,13 @@ void render_piece(float cx,float cy,float s,Piece p,Color c){
 }
 
 void render_game() {
-    glViewport(0,0,fbW,fbH);
-    glClearColor(0.08f,0.08f,0.12f,1);
-    glClear(GL_COLOR_BUFFER_BIT);
+    if(enable_3d){
+        render_3d();
+    }else{
+        glViewport(0,0,fbW,fbH);
+        glClearColor(0.08f,0.08f,0.12f,1);
+        glClear(GL_COLOR_BUFFER_BIT);
+    }
 
     int sq_size = std::min((fbW-60)/8,(fbH-60)/8);
     if (sq_size<20) sq_size=20;
@@ -836,38 +856,28 @@ void render_game() {
         panel_w = fbW-20; panel_h = fbH-panel_y-10;
     }
 
-    begin_frame();
-    fill_rect(0,0,(float)fbW,(float)fbH,0.08f,0.08f,0.12f);
-    // Board background
-    fill_rect((float)(bx-4),(float)(by-4),(float)(board_px+8),(float)(board_px+8),0.12f,0.12f,0.16f);
-
-    // Squares
-    for (int r=0;r<8;r++) for (int f=0;f<8;f++) {
-        float x=(float)(bx+f*sq_size),y=(float)(by+r*sq_size);
-        bool light=(f+r)%2==0;
-        float c=light?0.88f:0.55f;
-        fill_rect(x,y,(float)sq_size,(float)sq_size,c,c,(light?0.82f:0.45f));
+    if(!enable_3d){
+        begin_frame();
+        fill_rect(0,0,(float)fbW,(float)fbH,0.08f,0.08f,0.12f);
+        fill_rect((float)(bx-4),(float)(by-4),(float)(board_px+8),(float)(board_px+8),0.12f,0.12f,0.16f);
+        for (int r=0;r<8;r++) for (int f=0;f<8;f++) {
+            float x=(float)(bx+f*sq_size),y=(float)(by+r*sq_size);
+            bool light=(f+r)%2==0;
+            float c=light?0.88f:0.55f;
+            fill_rect(x,y,(float)sq_size,(float)sq_size,c,c,(light?0.82f:0.45f));
+        }
+        if (last_from>=0) {
+            fill_rect((float)(bx+file_of(last_from)*sq_size),(float)(by+rank_of(last_from)*sq_size),(float)sq_size,(float)sq_size,0.45f,0.55f,0.25f);
+            fill_rect((float)(bx+file_of(last_to)*sq_size),(float)(by+rank_of(last_to)*sq_size),(float)sq_size,(float)sq_size,0.45f,0.55f,0.25f);
+        }
+        if (sel>=0) fill_rect((float)(bx+file_of(sel)*sq_size),(float)(by+rank_of(sel)*sq_size),(float)sq_size,(float)sq_size,0.35f,0.65f,0.35f);
+        for (int m:legal_moves) fill_circle((float)(bx+file_of(m)*sq_size+sq_size/2),(float)(by+rank_of(m)*sq_size+sq_size/2),sq_size*0.12f,0.2f,0.9f,0.2f);
+        for (int r=0;r<8;r++) for (int f=0;f<8;f++) {
+            int idx=::sq(f,r);
+            if (board.p[idx]!=EMPTY) render_piece((float)(bx+f*sq_size+sq_size/2),(float)(by+r*sq_size+sq_size/2),(float)sq_size,board.p[idx],board.c[idx]);
+        }
+        end_frame();
     }
-
-    // Last move highlight
-    if (last_from>=0) {
-        fill_rect((float)(bx+file_of(last_from)*sq_size),(float)(by+rank_of(last_from)*sq_size),(float)sq_size,(float)sq_size,0.45f,0.55f,0.25f);
-        fill_rect((float)(bx+file_of(last_to)*sq_size),(float)(by+rank_of(last_to)*sq_size),(float)sq_size,(float)sq_size,0.45f,0.55f,0.25f);
-    }
-
-    // Selected
-    if (sel>=0) fill_rect((float)(bx+file_of(sel)*sq_size),(float)(by+rank_of(sel)*sq_size),(float)sq_size,(float)sq_size,0.35f,0.65f,0.35f);
-
-    // Legal moves
-    for (int m:legal_moves) fill_circle((float)(bx+file_of(m)*sq_size+sq_size/2),(float)(by+rank_of(m)*sq_size+sq_size/2),sq_size*0.12f,0.2f,0.9f,0.2f);
-
-    // Pieces
-    for (int r=0;r<8;r++) for (int f=0;f<8;f++) {
-        int idx=::sq(f,r);
-        if (board.p[idx]!=EMPTY) render_piece((float)(bx+f*sq_size+sq_size/2),(float)(by+r*sq_size+sq_size/2),(float)sq_size,board.p[idx],board.c[idx]);
-    }
-
-    end_frame();
 
     // Text overlay
     int fs = std::max(14, std::min(fbW/35, 32));
@@ -1008,11 +1018,17 @@ int menu_hit_test(double mx, double my) {
     return -1;
 }
 
-void on_mouse_button(GLFWwindow*,int button,int action,int) {
-    if (button!=GLFW_MOUSE_BUTTON_LEFT||action!=GLFW_PRESS) return;
-    double mx=mouse_x, my=mouse_y;
-    int ix=(int)mx, iy=(int)my;
-
+void on_mouse_button(GLFWwindow*,int button,int action,int){
+    if(button==GLFW_MOUSE_BUTTON_LEFT&&action==GLFW_PRESS){
+        handle_click(mouse_x,mouse_y);
+    }
+    if(button==GLFW_MOUSE_BUTTON_RIGHT&&action==GLFW_PRESS&&enable_3d&&mode==GAME){
+        cam_dragging=true;cam_drag_x=mouse_x;cam_drag_y=mouse_y;
+    }
+    if(action==GLFW_RELEASE&&cam_dragging)cam_dragging=false;
+}
+void handle_click(double mx,double my){
+    int ix=(int)mx,iy=(int)my;
     if (mode==MENU) {
         if (menu_page==MENU_MAIN) {
             int hit = menu_hit_test(mx,my);
@@ -1095,15 +1111,19 @@ void on_mouse_button(GLFWwindow*,int button,int action,int) {
         return;
     }
 
-    int sq_size = std::min((fbW-60)/8,(fbH-60)/8);
-    if (sq_size<20) sq_size=20;
-    int board_px = sq_size*8;
-    bool wide = (float)fbW/fbH > 1.3f;
-    int bx = wide?BOARD_OFF:(fbW-board_px)/2;
-    int by = wide?(fbH-board_px)/2:BOARD_OFF;
-
-    int fx=(ix-bx)/sq_size, ry=(iy-by)/sq_size;
-    if (fx>=0&&fx<8&&ry>=0&&ry<8) on_square_click(::sq(fx,ry));
+    if(enable_3d){
+        int sq=pick_square((double)ix,(double)iy);
+        if(sq>=0)on_square_click(sq);
+    }else{
+        int sq_size = std::min((fbW-60)/8,(fbH-60)/8);
+        if (sq_size<20) sq_size=20;
+        int board_px = sq_size*8;
+        bool wide = (float)fbW/fbH > 1.3f;
+        int bx = wide?BOARD_OFF:(fbW-board_px)/2;
+        int by = wide?(fbH-board_px)/2:BOARD_OFF;
+        int fx=(ix-bx)/sq_size, ry=(iy-by)/sq_size;
+        if (fx>=0&&fx<8&&ry>=0&&ry<8) on_square_click(::sq(fx,ry));
+    }
 }
 
 void on_key_menu(int key) {
@@ -1223,7 +1243,17 @@ void on_key(GLFWwindow* win,int key,int,int action,int mods) {
     else if (mode==GAME) on_key_game(key);
 }
 
-void on_cursor(GLFWwindow*,double x,double y){mouse_x=x;mouse_y=y;}
+void on_cursor(GLFWwindow*,double x,double y){
+    mouse_x=x;mouse_y=y;
+    if(cam_dragging){
+        double dx=x-cam_drag_x,dy=y-cam_drag_y;
+        cam_theta-=dx*0.005f;cam_phi+=dy*0.005f;
+        if(cam_phi>1.5f)cam_phi=1.5f;
+        if(cam_phi<-0.1f)cam_phi=-0.1f;
+        cam_drag_x=x;cam_drag_y=y;
+        cam_update();
+    }
+}
 
 void on_char(GLFWwindow*,unsigned int cp) {
     if (mode!=MENU) return;
@@ -1520,6 +1550,302 @@ void render_network_menu() {
 }
 
 // ============================================================
+// 3D SYSTEM
+// ============================================================
+struct vec3 {
+    float x,y,z;
+    vec3(float x=0,float y=0,float z=0):x(x),y(y),z(z){}
+    vec3 operator+(vec3 v)const{return {x+v.x,y+v.y,z+v.z};}
+    vec3 operator-(vec3 v)const{return {x-v.x,y-v.y,z-v.z};}
+    vec3 operator*(float s)const{return {x*s,y*s,z*s};}
+    float dot(vec3 v)const{return x*v.x+y*v.y+z*v.z;}
+    vec3 cross(vec3 v)const{return {y*v.z-z*v.y,z*v.x-x*v.z,x*v.y-y*v.x};}
+    float len()const{return sqrtf(x*x+y*y+z*z);}
+    vec3 norm()const{float l=len();return l>0?*this*(1.0f/l):*this;}
+};
+struct mat4 {
+    float m[16]={0};
+    mat4(){}
+    static mat4 identity(){mat4 r;r.m[0]=r.m[5]=r.m[10]=r.m[15]=1;return r;}
+    static mat4 perspective(float fov,float a,float n,float f){
+        mat4 r;float t=1.0f/tanf(fov/2);
+        r.m[0]=t/a;r.m[5]=t;r.m[10]=(f+n)/(n-f);r.m[11]=-1;r.m[14]=2*f*n/(n-f);
+        return r;
+    }
+    static mat4 lookAt(vec3 e,vec3 c,vec3 u){
+        vec3 f=(c-e).norm(),s=f.cross(u).norm(),t2=s.cross(f);
+        mat4 r=identity();
+        r.m[0]=s.x;r.m[4]=s.y;r.m[8]=s.z;
+        r.m[1]=t2.x;r.m[5]=t2.y;r.m[9]=t2.z;
+        r.m[2]=-f.x;r.m[6]=-f.y;r.m[10]=-f.z;
+        r.m[12]=-s.dot(e);r.m[13]=-t2.dot(e);r.m[14]=f.dot(e);
+        return r;
+    }
+    static mat4 translate(vec3 v){mat4 r=identity();r.m[12]=v.x;r.m[13]=v.y;r.m[14]=v.z;return r;}
+    static mat4 scale(vec3 v){mat4 r=identity();r.m[0]=v.x;r.m[5]=v.y;r.m[10]=v.z;return r;}
+    mat4 operator*(mat4 r)const{
+        mat4 res;
+        for(int i=0;i<4;i++)for(int j=0;j<4;j++)
+            res.m[i*4+j]=m[j]*r.m[i*4]+m[4+j]*r.m[i*4+1]+m[8+j]*r.m[i*4+2]+m[12+j]*r.m[i*4+3];
+        return res;
+    }
+};
+
+// Camera
+vec3 cam_eye(10,10,10),cam_center(0,0,0);
+float cam_dist=12,cam_theta=0.0f,cam_phi=0.7f;
+mat4 cam_view,cam_proj;
+bool cam_dragging=false;double cam_drag_x,cam_drag_y;
+bool enable_3d=true;
+
+void cam_update() {
+    cam_eye.x=cam_center.x+cam_dist*sinf(cam_theta)*cosf(cam_phi);
+    cam_eye.y=cam_center.y+cam_dist*sinf(cam_phi);
+    cam_eye.z=cam_center.z+cam_dist*cosf(cam_theta)*cosf(cam_phi);
+    cam_view=mat4::lookAt(cam_eye,cam_center,{0,1,0});
+    float ar=(float)fbW/fbH;
+    cam_proj=mat4::perspective(0.6f,ar,0.1f,50);
+}
+
+// Mesh
+struct Mesh3D {GLuint vao=0,vbo=0;int count=0;};
+Mesh3D mesh_board,mesh_pieces[7];
+bool mesh_ready=false;
+
+void add_vert(std::vector<float>& v,vec3 p,vec3 n,vec3 c) {
+    v.insert(v.end(),{p.x,p.y,p.z,n.x,n.y,n.z,c.x,c.y,c.z});
+}
+vec3 fnormal(vec3 a,vec3 b,vec3 c){return (b-a).cross(c-a).norm();}
+
+void build_mesh(Mesh3D& m,const std::vector<float>& v) {
+    if(m.vao)glDeleteVertexArrays(1,&m.vao);
+    if(m.vbo)glDeleteBuffers(1,&m.vbo);
+    glGenVertexArrays(1,&m.vao);glGenBuffers(1,&m.vbo);
+    glBindVertexArray(m.vao);glBindBuffer(GL_ARRAY_BUFFER,m.vbo);
+    glBufferData(GL_ARRAY_BUFFER,v.size()*4,v.data(),GL_STATIC_DRAW);
+    glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,9*4,(void*)0);glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1,3,GL_FLOAT,GL_FALSE,9*4,(void*)(3*4));glEnableVertexAttribArray(1);
+    glVertexAttribPointer(2,3,GL_FLOAT,GL_FALSE,9*4,(void*)(6*4));glEnableVertexAttribArray(2);
+    m.count=(int)v.size()/9;
+}
+
+void aq(std::vector<float>& v,vec3 a,vec3 b,vec3 c,vec3 d,vec3 col) {
+    vec3 n=fnormal(a,b,c);
+    add_vert(v,a,n,col);add_vert(v,b,n,col);add_vert(v,c,n,col);
+    add_vert(v,a,n,col);add_vert(v,c,n,col);add_vert(v,d,n,col);
+}
+
+void add_cylinder(std::vector<float>& v,int sl,float r,float h,vec3 col,float yb=0) {
+    for(int i=0;i<sl;i++){
+        float a0=6.283185f*i/sl,a1=6.283185f*(i+1)/sl;
+        float c0=cosf(a0),s0=sinf(a0),c1=cosf(a1),s1=sinf(a1);
+        vec3 p00(r*c0,yb,r*s0),p01(r*c1,yb,r*s1);
+        vec3 p10(r*c0,yb+h,r*s0),p11(r*c1,yb+h,r*s1);
+        vec3 n0(c0,0,s0),n1(c1,0,s1);
+        add_vert(v,p00,n0,col);add_vert(v,p01,n1,col);add_vert(v,p11,n1,col);
+        add_vert(v,p00,n0,col);add_vert(v,p11,n1,col);add_vert(v,p10,n0,col);
+        add_vert(v,{0,yb,0},{0,-1,0},col);add_vert(v,p01,{0,-1,0},col);add_vert(v,p00,{0,-1,0},col);
+        add_vert(v,{0,yb+h,0},{0,1,0},col);add_vert(v,p10,{0,1,0},col);add_vert(v,p11,{0,1,0},col);
+    }
+}
+void add_sphere_top(std::vector<float>& v,int sl,int st,float r,float y0,float h,vec3 col,float yb=0) {
+    float yy0=y0+yb;
+    for(int j=0;j<st;j++){
+        float t0=(float)j/st*3.14159f/2,t1=(float)(j+1)/st*3.14159f/2;
+        float rj0=r*sinf(t0),rj1=r*sinf(t1);
+        float yj0=yy0+h*sinf(t0),yj1=yy0+h*sinf(t1);
+        for(int i=0;i<sl;i++){
+            float a0=6.283185f*i/sl,a1=6.283185f*(i+1)/sl;
+            float ca0=cosf(a0),sa0=sinf(a0),ca1=cosf(a1),sa1=sinf(a1);
+            vec3 p00(rj0*ca0,yj0,rj0*sa0),p01(rj1*ca0,yj1,rj1*sa0);
+            vec3 p10(rj0*ca1,yj0,rj0*sa1),p11(rj1*ca1,yj1,rj1*sa1);
+            vec3 n00(sinf(t0)*ca0,cosf(t0),sinf(t0)*sa0);
+            vec3 n01(sinf(t1)*ca0,cosf(t1),sinf(t1)*sa0);
+            vec3 n10(sinf(t0)*ca1,cosf(t0),sinf(t0)*sa1);
+            vec3 n11(sinf(t1)*ca1,cosf(t1),sinf(t1)*sa1);
+            add_vert(v,p00,n00,col);add_vert(v,p01,n01,col);add_vert(v,p11,n11,col);
+            add_vert(v,p00,n00,col);add_vert(v,p11,n11,col);add_vert(v,p10,n10,col);
+        }
+    }
+}
+void add_cone(std::vector<float>& v,int sl,float r,float h,vec3 col,float yb=0) {
+    for(int i=0;i<sl;i++){
+        float a0=6.283185f*i/sl,a1=6.283185f*(i+1)/sl;
+        float c0=cosf(a0),s0=sinf(a0),c1=cosf(a1),s1=sinf(a1);
+        vec3 tip(0,yb+h,0),b0(r*c0,yb,r*s0),b1(r*c1,yb,r*s1);
+        vec3 sn=fnormal(tip,b1,b0);
+        add_vert(v,tip,sn,col);add_vert(v,b1,sn,col);add_vert(v,b0,sn,col);
+        add_vert(v,{0,yb,0},{0,-1,0},col);add_vert(v,b1,{0,-1,0},col);add_vert(v,b0,{0,-1,0},col);
+    }
+}
+
+void gen_piece_mesh(Mesh3D& m,Piece type) {
+    std::vector<float> v;int sl=20;
+    switch(type){
+        case P: // pawn ~0.74
+            add_cylinder(v,sl,0.38f,0.06f,{1,1,1});
+            add_cylinder(v,sl,0.24f,0.22f,{1,1,1},0.06f);
+            add_cylinder(v,sl,0.16f,0.06f,{1,1,1},0.28f);
+            add_cylinder(v,sl,0.28f,0.10f,{1,1,1},0.34f);
+            add_cylinder(v,sl,0.10f,0.06f,{1,1,1},0.44f);
+            add_sphere_top(v,sl,8,0.20f,0,0.24f,{1,1,1},0.50f);
+            break;
+        case N: // knight ~1.08
+            add_cylinder(v,sl,0.38f,0.06f,{1,1,1});
+            add_cylinder(v,sl,0.28f,0.20f,{1,1,1},0.06f);
+            add_cylinder(v,sl,0.20f,0.08f,{1,1,1},0.26f);
+            add_cylinder(v,sl,0.32f,0.14f,{1,1,1},0.34f);
+            add_cylinder(v,sl,0.20f,0.18f,{1,1,1},0.48f);
+            add_sphere_top(v,sl,8,0.22f,0,0.22f,{1,1,1},0.66f);
+            add_cone(v,sl,0.10f,0.20f,{1,1,1},0.88f);
+            break;
+        case B: // bishop ~1.04
+            add_cylinder(v,sl,0.38f,0.06f,{1,1,1});
+            add_cylinder(v,sl,0.26f,0.20f,{1,1,1},0.06f);
+            add_cylinder(v,sl,0.20f,0.08f,{1,1,1},0.26f);
+            add_cylinder(v,sl,0.32f,0.14f,{1,1,1},0.34f);
+            add_cone(v,sl,0.32f,0.44f,{1,1,1},0.48f);
+            add_sphere_top(v,sl,8,0.12f,0,0.12f,{1,1,1},0.92f);
+            break;
+        case R: // rook ~0.72
+            add_cylinder(v,sl,0.42f,0.06f,{1,1,1});
+            add_cylinder(v,sl,0.32f,0.56f,{1,1,1},0.06f);
+            add_cylinder(v,sl,0.40f,0.04f,{1,1,1},0.62f);
+            add_cylinder(v,sl,0.30f,0.06f,{1,1,1},0.66f);
+            break;
+        case Q: // queen ~1.16
+            add_cylinder(v,sl,0.40f,0.06f,{1,1,1});
+            add_cylinder(v,sl,0.30f,0.22f,{1,1,1},0.06f);
+            add_cylinder(v,sl,0.22f,0.08f,{1,1,1},0.28f);
+            add_cylinder(v,sl,0.34f,0.12f,{1,1,1},0.36f);
+            add_sphere_top(v,sl,8,0.32f,0,0.32f,{1,1,1},0.48f);
+            add_cylinder(v,sl,0.08f,0.08f,{1,1,1},0.80f);
+            add_sphere_top(v,sl,8,0.22f,0,0.18f,{1,1,1},0.88f);
+            add_cone(v,sl,0.06f,0.12f,{1,1,1},1.06f);
+            break;
+        case K: // king ~1.22
+            add_cylinder(v,sl,0.40f,0.06f,{1,1,1});
+            add_cylinder(v,sl,0.30f,0.22f,{1,1,1},0.06f);
+            add_cylinder(v,sl,0.22f,0.08f,{1,1,1},0.28f);
+            add_cylinder(v,sl,0.34f,0.14f,{1,1,1},0.36f);
+            add_cone(v,sl,0.32f,0.30f,{1,1,1},0.50f);
+            add_sphere_top(v,sl,8,0.26f,0,0.22f,{1,1,1},0.80f);
+            add_cylinder(v,sl,0.06f,0.25f,{1,1,1},1.02f);
+            add_cylinder(v,sl,0.20f,0.04f,{1,1,1},1.14f);
+            break;
+        default:break;
+    }
+    build_mesh(m,v);
+}
+
+void gen_board() {
+    std::vector<float> v;
+    float b=4.3f,bh=0.3f;
+    vec3 brown(0.22f,0.11f,0.04f),lwood(0.92f,0.82f,0.58f),dwood(0.58f,0.38f,0.14f);
+    vec3 silver(0.7f,0.7f,0.78f),milk(0.95f,0.93f,0.87f);
+    aq(v,{-b,-bh,-b},{b,-bh,-b},{b,-bh,b},{-b,-bh,b},brown);
+    aq(v,{-b,-bh,-b},{b,-bh,-b},{b,0,-b},{-b,0,-b},brown);
+    aq(v,{b,-bh,-b},{b,-bh,b},{b,0,b},{b,0,-b},brown);
+    aq(v,{b,-bh,b},{-b,-bh,b},{-b,0,b},{b,0,b},brown);
+    aq(v,{-b,-bh,b},{-b,-bh,-b},{-b,0,-b},{-b,0,b},brown);
+    float ri=0.2f;
+    aq(v,{-b,0,-b},{b,0,-b},{b,0,-b+ri},{-b,0,-b+ri},brown);
+    aq(v,{b,0,-b},{b,0,b},{b-ri,0,b},{b-ri,0,-b},brown);
+    aq(v,{b,0,b},{-b,0,b},{-b,0,b-ri},{b,0,b-ri},brown);
+    aq(v,{-b,0,b},{-b,0,-b},{-b+ri,0,-b},{-b+ri,0,b},brown);
+    float mw=0.03f;
+    aq(v,{-b,0.008f,-b},{b,0.008f,-b},{b,0.008f,-b+mw},{-b,0.008f,-b+mw},milk);
+    aq(v,{b,0.008f,-b},{b,0.008f,b},{b-mw,0.008f,b},{b-mw,0.008f,-b},milk);
+    aq(v,{b,0.008f,b},{-b,0.008f,b},{-b,0.008f,b-mw},{b,0.008f,b-mw},milk);
+    aq(v,{-b,0.008f,b},{-b,0.008f,-b},{-b+mw,0.008f,-b},{-b+mw,0.008f,b},milk);
+    float sq=1.0f,sy=0.005f,ri2=ri+0.02f;
+    for(int x=0;x<8;x++)for(int y=0;y<8;y++){
+        float fx=(float)x-4,fy=(float)y-4;
+        vec3 wood=((x+y)%2)?lwood:dwood;
+        vec3 side(wood.x*0.6f,wood.y*0.6f,wood.z*0.6f);
+        vec3 n0(0,1,0);
+        add_vert(v,{fx,sy,fy},n0,wood);add_vert(v,{fx+sq,sy,fy},n0,wood);
+        add_vert(v,{fx+sq,sy,fy+sq},n0,wood);
+        add_vert(v,{fx,sy,fy},n0,wood);add_vert(v,{fx+sq,sy,fy+sq},n0,wood);
+        add_vert(v,{fx,sy,fy+sq},n0,wood);
+        float sy1=sy+0.005f;
+        aq(v,{fx,sy,fy},{fx+sq,sy,fy},{fx+sq,sy1,fy},{fx,sy1,fy},side);
+        aq(v,{fx+sq,sy,fy},{fx+sq,sy,fy+sq},{fx+sq,sy1,fy+sq},{fx+sq,sy1,fy},side);
+        aq(v,{fx+sq,sy,fy+sq},{fx,sy,fy+sq},{fx,sy1,fy+sq},{fx+sq,sy1,fy+sq},side);
+        aq(v,{fx,sy,fy+sq},{fx,sy,fy},{fx,sy1,fy},{fx,sy1,fy+sq},side);
+    }
+    float slw=0.012f,sly=0.008f,si=-4+ri2,sf=4-ri2;
+    for(int i=1;i<8;i++){
+        float p=(float)i-4;
+        aq(v,{si,sly,p-slw},{sf,sly,p-slw},{sf,sly,p+slw},{si,sly,p+slw},silver);
+        aq(v,{p-slw,sly,si},{p+slw,sly,si},{p+slw,sly,sf},{p-slw,sly,sf},silver);
+    }
+    build_mesh(mesh_board,v);
+}
+
+void init_3d() {
+    mesh_ready=false;
+    gen_board();
+    for(int i=1;i<=6;i++)gen_piece_mesh(mesh_pieces[i],(Piece)i);
+    cam_update();
+    mesh_ready=true;
+}
+
+void render_mesh(const Mesh3D& m,const mat4& model,const mat4& view,const mat4& proj) {
+    if(!m.count)return;
+    mat4 mvp=proj*view*model;
+    glUniformMatrix4fv(glGetUniformLocation(shader_3d,"uMVP"),1,GL_FALSE,mvp.m);
+    glUniformMatrix4fv(glGetUniformLocation(shader_3d,"uM"),1,GL_FALSE,model.m);
+    glBindVertexArray(m.vao);
+    glDrawArrays(GL_TRIANGLES,0,m.count);
+}
+
+void render_3d() {
+    if(!mesh_ready||!shader_3d)return;
+    glViewport(0,0,fbW,fbH);
+    glEnable(GL_DEPTH_TEST);
+    glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
+    glUseProgram(shader_3d);
+    glUniform3f(glGetUniformLocation(shader_3d,"uLD"),-0.3f,-0.8f,-0.5f);
+    glUniform3f(glGetUniformLocation(shader_3d,"uVP"),cam_eye.x,cam_eye.y,cam_eye.z);
+    glUniform1f(glGetUniformLocation(shader_3d,"uAmb"),0.25f);
+    glUniform3f(glGetUniformLocation(shader_3d,"uCol"),1,1,1);
+    render_mesh(mesh_board,mat4::identity(),cam_view,cam_proj);
+    vec3 wc(0.95f,0.92f,0.85f),bc(0.32f,0.16f,0.06f);
+    for(int r=0;r<8;r++)for(int f=0;f<8;f++){
+        int idx=::sq(f,r);
+        if(board.p[idx]==EMPTY)continue;
+        vec3 col=board.c[idx]==WHITE?wc:bc;
+        glUniform3f(glGetUniformLocation(shader_3d,"uCol"),col.x,col.y,col.z);
+        render_mesh(mesh_pieces[board.p[idx]],mat4::translate({(float)f-3.5f,0.005f,(float)r-3.5f}),cam_view,cam_proj);
+    }
+    glDisable(GL_DEPTH_TEST);
+}
+
+int pick_square(double mx,double my) {
+    float ndx=(float)(2.0*mx/fbW-1),ndy=(float)(1.0-2.0*my/fbH);
+    float aspect=(float)fbW/fbH,fov=0.6f;
+    float half_h=tanf(fov/2),half_w=half_h*aspect;
+    vec3 ray_ndx(ndx*half_w,ndy*half_h,-1);
+    vec3 fwd=(cam_center-cam_eye).norm();
+    vec3 side=fwd.cross({0,1,0}).norm();
+    vec3 up=side.cross(fwd);
+    vec3 world_dir(
+        side.x*ray_ndx.x+up.x*ray_ndx.y-fwd.x*ray_ndx.z,
+        side.y*ray_ndx.x+up.y*ray_ndx.y-fwd.y*ray_ndx.z,
+        side.z*ray_ndx.x+up.z*ray_ndx.y-fwd.z*ray_ndx.z);
+    if(fabsf(world_dir.y)<0.0001f)return -1;
+    float t=-cam_eye.y/world_dir.y;
+    if(t<0)return -1;
+    vec3 hit=cam_eye+world_dir*t;
+    int fx=(int)(hit.x+4),fy=(int)(hit.z+4);
+    if(fx<0||fx>7||fy<0||fy>7)return -1;
+    return fy*8+fx;
+}
+
+
+
+// ============================================================
 // MAIN
 // ============================================================
 int main() {
@@ -1527,6 +1853,7 @@ int main() {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR,3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR,3);
     glfwWindowHint(GLFW_OPENGL_PROFILE,GLFW_OPENGL_CORE_PROFILE);
+    glfwWindowHint(GLFW_DEPTH_BITS,24);
 
     window = glfwCreateWindow(1024,768,"Schach",nullptr,nullptr);
     if (!window) { glfwTerminate(); return -1; }
@@ -1548,6 +1875,7 @@ int main() {
 
     if (!init_shaders()) { fprintf(stderr,"shader init failed\n"); return -1; }
     if (!init_font()) { fprintf(stderr,"font init failed\n"); return -1; }
+    init_3d();
 
     glfwGetFramebufferSize(window, &fbW, &fbH);
 
@@ -1555,7 +1883,8 @@ int main() {
     glfwSetKeyCallback(window,on_key);
     glfwSetCharCallback(window,on_char);
     glfwSetCursorPosCallback(window,on_cursor);
-    glfwSetFramebufferSizeCallback(window,[](GLFWwindow*,int w,int h){fbW=w;fbH=h;need_font_rebake=true;});
+    glfwSetScrollCallback(window,[](GLFWwindow*,double,double dy){if(enable_3d){cam_dist*=(float)(1-dy*0.05);if(cam_dist<3)cam_dist=3;if(cam_dist>40)cam_dist=40;cam_update();}});
+    glfwSetFramebufferSizeCallback(window,[](GLFWwindow*,int w,int h){fbW=w;fbH=h;need_font_rebake=true;cam_update();});
     glfwSwapInterval(1);
 
     init_board();
